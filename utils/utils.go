@@ -1,18 +1,19 @@
 package utils
 
-type StorageWriter struct {
+type StorageWriter interface {
+	New(errorChannel *chan error) (StorageWriter, error)
+	Stop()
+	LastBlockNumber() int64
+	UploadRecords(records []Record) error // last saved block, error
 }
 type StateChangeRecord struct {
-	BlockNumber int64   `avro:"block_number"`
-	Timestamp   int64   `avro:"timestamp"`
-	Contract    string  `avro:"contract"`
-	Location    *string `avro:"location"`
-	Position    *int    `avro:"position"`
-	Arg1        *string `avro:"arg1"`
-	Arg2        *string `avro:"arg2"`
-	Index1      *int    `avro:"index1"`
-	Index2      *int    `avro:"index2"`
-	Index3      *int    `avro:"index3"`
+	BlockNumber int64    `avro:"block_number"`
+	Timestamp   int64    `avro:"timestamp"`
+	Contract    string   `avro:"contract"`
+	Location    string   `avro:"location"`
+	Position    *string  `avro:"position"`
+	Args        []string `avro:"args"`
+	Value       string   `avro:"value"`
 }
 type AccountBalanceRecord struct {
 	BlockNumber int64  `avro:"block_number"`

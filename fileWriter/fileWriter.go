@@ -1,19 +1,14 @@
 // Taoufik 03/2023
-package s3Writer
+package fileWriter
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/mazeboard/storage/utils"
 	"io"
 	"log"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,94 +20,70 @@ type FileRecord struct {
 	content        []string
 	maxBlockNumber int64
 }
-type s3Writer struct {
+type fileWriter struct {
 	utils.StorageWriter
-	sessionLock     sync.RWMutex
-	s3Services      []*s3.S3
-	bucket          string
-	prefix          string
-	region          string
-	profile         string
+	datadir         string
 	nconnections    int
 	connectionLocks []sync.RWMutex
 	files           map[string]*FileRecord
 	filesLock       sync.RWMutex
-	filesS3Svc      *s3.S3
-	uploader        *s3manager.Uploader
 	running         bool
 	stopped         chan bool
 	lastBlockNumber int64 // last block saved to s3
 	dataFile        string
 	errorChannel    *chan error
-	retries         int
 }
 
 func New(errorChannel *chan error) (utils.StorageWriter, error) {
-	bucket := os.Getenv("STORAGE_AWS_S3_BUCKET") //
-	prefix := os.Getenv("STORAGE_AWS_S3_PREFIX")
-	region := os.Getenv("AWS_REGION") // "eu-west-1"
-	//profile := os.Getenv("AWS_PROFILE") // "649502643044_DeveloperAccess"
-	if bucket == "" || region == "" {
-		return nil, errors.New("must define environement variables STORAGE_AWS_S3_BUCKET, AWS_REGION")
+	datadir := os.Getenv("STORAGE_DATADIR")
+	if datadir == "" {
+		if dir, err := os.UserHomeDir(); err == nil {
+			datadir = dir + "/.storage"
+		} else {
+			return nil, err
+		}
 	}
-	w := s3Writer{
+	stat, err := os.Stat(datadir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if err = os.Mkdir(datadir, 0755); err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
+	} else {
+		if !stat.IsDir() {
+			return nil, errors.New(fmt.Sprintf("%s is not a directory", datadir))
+		}
+	}
+
+	w := fileWriter{
 		errorChannel:    errorChannel,
-		nconnections:    128,
+		nconnections:    32,
 		connectionLocks: []sync.RWMutex{},
-		bucket:          bucket,
-		prefix:          prefix,
+		datadir:         datadir,
 		files:           make(map[string]*FileRecord),
 		filesLock:       sync.RWMutex{},
-		sessionLock:     sync.RWMutex{},
-		//uploader:        s3manager.NewUploader(sess),
 		running:         true,
 		stopped:         make(chan bool),
 		lastBlockNumber: 0,
-		retries:         10,
 	}
-	var dir string
-	var err error
-	if dir, err = os.UserHomeDir(); err == nil {
-		w.dataFile = dir + "/.s3WriterData"
-	}
+	w.dataFile = datadir + "/.fileWriterData"
 
 	for i := 0; i < w.nconnections; i++ {
 		w.connectionLocks = append(w.connectionLocks, sync.RWMutex{})
 	}
-	w.createConnections()
 	w.readData()
 	go w.watch()
 	return &w, nil
 }
 
-func (w *s3Writer) createConnections() {
-	for i := 0; i < w.nconnections; i++ {
-		w.s3Services = append(w.s3Services, s3.New(w.createSession()))
-	}
-}
-
-func (w *s3Writer) createSession() *session.Session {
-	if sess, err := session.NewSessionWithOptions(session.Options{
-		//SharedConfigState: session.SharedConfigEnable,
-		//Profile:           w.profile,
-		Config: aws.Config{Region: &w.region},
-	}); err != nil {
-		*w.errorChannel <- err
-		panic(err)
-	} else {
-		return sess
-	}
-}
-func (w *s3Writer) recreateConnection(s3SvcIndex int) {
-	log.Printf("s3Writer recreate connection %d\n", s3SvcIndex)
-	w.s3Services[s3SvcIndex] = s3.New(w.createSession())
-}
-
-func (w *s3Writer) LastBlockNumber() int64 {
+func (w *fileWriter) LastBlockNumber() int64 {
 	return w.lastBlockNumber
 }
 
-func (w *s3Writer) readData() {
+func (w *fileWriter) readData() {
 	buf, err := os.ReadFile(w.dataFile)
 	if err == nil {
 		data := string(buf)
@@ -121,18 +92,18 @@ func (w *s3Writer) readData() {
 		}
 	}
 }
-func (s *s3Writer) writeData(data string) {
+func (s *fileWriter) writeData(data string) {
 	err := os.WriteFile(s.dataFile, []byte(data), 0755)
 	if err != nil {
 		log.Printf("failed to save block number - error %s\n", err)
 	}
 }
-func (w *s3Writer) Stop() {
+func (w *fileWriter) Stop() {
 	w.running = false
 	<-w.stopped
 }
-func (w *s3Writer) watch() {
-	log.Println("s3Writer watch started")
+func (w *fileWriter) watch() {
+	log.Println("fileWriter watch started")
 	delay := 30 * time.Second
 	for {
 		// TODO if current month then save records that are old by 1 minute
@@ -157,14 +128,13 @@ func (w *s3Writer) watch() {
 		}
 		if err := w.saveFiles(saveFiles); err != nil {
 			w.filesLock.Unlock()
-			*w.errorChannel <- errors.New(fmt.Sprintf("s3Writer save files failed - error %s\n", err))
-			w.stopped <- true
+			*w.errorChannel <- errors.New(fmt.Sprintf("fileWriter save files failed - error %s\n", err))
 			return
 		} else {
 			if len(saveFiles) > 0 {
 				w.writeData(fmt.Sprintf("%d", w.lastBlockNumber))
 			}
-			log.Printf("s3Writer saved files %d (%d) - lastBlock %d - elapsed %s\n", len(saveFiles), len(w.files), w.lastBlockNumber, time.Since(start))
+			log.Printf("fileWriter saved files %d (%d) - lastBlock %d - elapsed %s\n", len(saveFiles), len(w.files), w.lastBlockNumber, time.Since(start))
 		}
 		if len(w.files) == 0 && !w.running {
 			w.filesLock.Unlock()
@@ -175,40 +145,34 @@ func (w *s3Writer) watch() {
 	}
 }
 
-func (w *s3Writer) getObject(s3SvcIndex int, file string) (io.ReadCloser, error) {
-	s3Svc := w.s3Services[s3SvcIndex]
-	if rawObject, err := s3Svc.GetObject(
-		&s3.GetObjectInput{
-			Bucket: aws.String(w.bucket),
-			Key:    aws.String(file),
-		}); err != nil {
-		if aerr, ok := err.(awserr.Error); ok {
-			switch aerr.Code() {
-			case s3.ErrCodeNoSuchKey:
-				return nil, nil
-			}
-		}
-		time.Sleep(5 * time.Second)
-		w.recreateConnection(s3SvcIndex)
-		return w.getObject(s3SvcIndex, file)
-	} else {
-		return rawObject.Body, nil
+func (w *fileWriter) writeFile(file string, content []byte) error {
+	err := os.MkdirAll(path.Dir(file), 0755)
+	if err != nil {
+		return err
 	}
-}
-func (w *s3Writer) putObject(s3SvcIndex int, file string, body []byte) error {
-	s3Svc := w.s3Services[s3SvcIndex]
-	if _, err := s3Svc.PutObject(&s3.PutObjectInput{
-		Bucket: aws.String(w.bucket),
-		Key:    aws.String(file),
-		Body:   bytes.NewReader(body),
-	}); err != nil {
-		time.Sleep(5 * time.Second)
-		w.recreateConnection(s3SvcIndex)
-		return w.putObject(s3SvcIndex, file, body)
+	f, err := os.OpenFile(file+"_temp", os.O_CREATE|os.O_WRONLY, 0755)
+	if err != nil {
+		return err
+	} else {
+		defer func(f *os.File) {
+			err := f.Close()
+			if err != nil {
+				log.Printf("failed to close file %s", file)
+			}
+		}(f)
+		_, err = f.Write(content)
+		if err != nil {
+			return err
+		}
+		err := os.Rename(file+"_temp", file)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
-func (w *s3Writer) saveFiles(records []*FileRecord) error {
+
+func (w *fileWriter) saveFiles(records []*FileRecord) error {
 	parts := utils.Partition(w.nconnections, records)
 	var wg sync.WaitGroup
 	wg.Add(w.nconnections)
@@ -221,7 +185,9 @@ func (w *s3Writer) saveFiles(records []*FileRecord) error {
 			for _, rec := range records {
 				if err == nil {
 					buf := w.distinct(rec)
-					if err = w.putObject(i, rec.file, buf); err != nil {
+					e := w.writeFile(rec.file, buf)
+					if e != nil {
+						err = e
 						return
 					}
 				}
@@ -233,11 +199,10 @@ func (w *s3Writer) saveFiles(records []*FileRecord) error {
 }
 
 // rows are ordered by block numbers
-func (w *s3Writer) distinctKey(content []string) []string {
+func (w *fileWriter) distinctKey(content []string, key func(s string) string) []string {
 	ss := make(map[string]string)
 	for _, row := range content {
-		i := strings.IndexByte(row, ',')
-		ss[row[:i]] = row
+		ss[key(row)] = row
 	}
 	res := []string{}
 	for _, row := range ss {
@@ -245,12 +210,29 @@ func (w *s3Writer) distinctKey(content []string) []string {
 	}
 	return res
 }
-func (w *s3Writer) distinct(rec *FileRecord) []byte {
-	r := w.distinctKey(rec.content)
+func (w *fileWriter) distinct(rec *FileRecord) []byte {
+	isBalance := strings.HasSuffix(rec.file, "balance.csv")
+	r := w.distinctKey(rec.content, func(s string) string {
+		if isBalance {
+			// for balance.csv block_number, timestamp, balance
+			//    key is block_number
+			i := strings.IndexByte(s, ',')
+			sbn := s[:i]
+			return sbn
+		} else {
+			// for value.csv block_number, timestamp, location, value, args...
+			//    key is block_number, location
+			i := strings.IndexByte(s, ',')
+			sbn := s[:i]
+			j := strings.IndexByte(s[i:], ',')
+			k := strings.IndexByte(s[j:], ',')
+			return sbn + s[j:k]
+		}
+	})
 	return []byte(strings.Join(r, "\n"))
 }
 
-func (w *s3Writer) UploadRecords(records []utils.Record) error {
+func (w *fileWriter) UploadRecords(records []utils.Record) error {
 	w.filesLock.Lock()
 	defer w.filesLock.Unlock()
 	fileRecords := []*FileRecord{}
@@ -259,8 +241,8 @@ func (w *s3Writer) UploadRecords(records []utils.Record) error {
 		if record.AccountBalance != nil {
 			rec := record.AccountBalance
 			t := time.Unix(rec.Timestamp, 0)
-			month = fmt.Sprintf("%d/%02d", t.Year(), t.Month()) // by hour creates a huge number of files
-			file := fmt.Sprintf("%s%s/%s/balance.csv", w.prefix, rec.Account, month)
+			month = fmt.Sprintf("%d%02d", t.Year(), t.Month()) // by hour creates a huge number of files
+			file := fmt.Sprintf("%s/%s/%s_balance.csv", w.datadir, rec.Account, month)
 			fileRecord := w.addRow(rec.BlockNumber, file, w.accountBalanceRow(rec))
 			if fileRecord != nil {
 				fileRecords = append(fileRecords, fileRecord)
@@ -271,12 +253,15 @@ func (w *s3Writer) UploadRecords(records []utils.Record) error {
 			var fileRecord *FileRecord
 			if rec.Position == nil {
 				month = fmt.Sprintf("%d/%02d", t.Year(), t.Month())
-				file := fmt.Sprintf("%s%s/s%s/%s/value.csv", w.prefix, rec.Contract, rec.Location, month)
+				file := fmt.Sprintf("%s%s/%s/%s/value.csv", w.datadir, rec.Contract, month, rec.Location)
 				fileRecord = w.addRow(rec.BlockNumber, file, w.stateChangeRow(rec))
 			} else {
 				month = fmt.Sprintf("%d/%02d", t.Year(), t.Month())
-				file := fmt.Sprintf("%s%s/p%s/%s/value.csv", w.prefix, rec.Contract, *rec.Position, month)
+				file := fmt.Sprintf("%s%s/%s/%s/value.csv", w.datadir, rec.Contract, *rec.Position, month)
 				fileRecord = w.addRow(rec.BlockNumber, file, w.stateChangeRow(rec))
+			}
+			if fileRecord != nil {
+				fileRecords = append(fileRecords, fileRecord)
 			}
 			if fileRecord != nil {
 				fileRecords = append(fileRecords, fileRecord)
@@ -288,7 +273,7 @@ func (w *s3Writer) UploadRecords(records []utils.Record) error {
 	return w.loadFiles(fileRecords)
 }
 
-func (w *s3Writer) addRow(blockNumber int64, file string, row string) *FileRecord {
+func (w *fileWriter) addRow(blockNumber int64, file string, row string) *FileRecord {
 	if rec, ok := w.files[file]; ok {
 		if rec.maxBlockNumber < blockNumber {
 			rec.maxBlockNumber = blockNumber
@@ -301,28 +286,48 @@ func (w *s3Writer) addRow(blockNumber int64, file string, row string) *FileRecor
 			maxBlockNumber: blockNumber,
 		}
 		w.files[file] = &record
+		// loadFiles will load existing file from storage and add row
 		return &record
 	}
 	return nil
 }
 
-func (w *s3Writer) loadFile(i int, record *FileRecord) error {
-	if body, err := w.getObject(i, record.file); err != nil {
+func (w *fileWriter) loadFile(record *FileRecord) error {
+	if _, err := os.Stat(record.file); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	} else {
-		if body != nil {
-			buf := new(bytes.Buffer)
-			if _, err := buf.ReadFrom(body); err != nil {
-				return err
-			} else {
-				record.content = append(strings.Split(buf.String(), "\n"), record.content...)
+		f, err := os.OpenFile(record.file, os.O_RDONLY, 0755)
+		if err != nil {
+			return err
+		} else {
+			defer func(f *os.File) {
+				err := f.Close()
+				if err != nil {
+					log.Printf("failed to close file %s", record.file)
+				}
+			}(f)
+			b := make([]byte, 2048, 2048)
+			oldContent := ""
+			for {
+				if n, err := f.Read(b); err != nil {
+					if err == io.EOF {
+						break
+					}
+					return err
+				} else {
+					oldContent += string(b[:n])
+				}
 			}
+			record.content = append(strings.Split(oldContent, "\n"), record.content...)
+			return nil
 		}
-		return nil
 	}
 }
 
-func (w *s3Writer) loadFiles(fileRecords []*FileRecord) error {
+func (w *fileWriter) loadFiles(fileRecords []*FileRecord) error {
 	start := time.Now()
 	parts := utils.Partition(w.nconnections, fileRecords)
 	var wg sync.WaitGroup
@@ -337,7 +342,7 @@ func (w *s3Writer) loadFiles(fileRecords []*FileRecord) error {
 				if err != nil {
 					return
 				}
-				e := w.loadFile(i, record)
+				e := w.loadFile(record)
 				if e != nil {
 					err = e
 					return
@@ -370,36 +375,23 @@ func (w *s3Writer) loadFiles(fileRecords []*FileRecord) error {
 //
 // key names in values.csv depend on the variable of the contract (ie. position)
 
-func (w *s3Writer) accountBalanceRow(record *utils.AccountBalanceRecord) string {
+func (w *fileWriter) accountBalanceRow(record *utils.AccountBalanceRecord) string {
 	return fmt.Sprintf("%d,%d,%s", record.BlockNumber, record.Timestamp, record.Balance)
 }
-func (w *s3Writer) stateChangeRow(record *utils.StateChangeRecord) string {
+func (w *fileWriter) stateChangeRow(record *utils.StateChangeRecord) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("%d,%d,", record.BlockNumber, record.Timestamp))
-	value := strings.TrimLeft(record.Value, "0")
-	if value == "" {
-		value = "0"
-	}
 	if record.Position == nil {
-		sb.WriteString(value)
+		sb.WriteString(record.Value)
 	} else {
 		if len(record.Args) > 0 {
-			sb.WriteString(value + ",")
+			sb.WriteString(record.Value + ",")
 			for _, arg := range record.Args[:len(record.Args)-1] {
-				arg = strings.TrimLeft(arg, "0")
-				if arg == "" {
-					arg = "0"
-				}
 				sb.WriteString(arg + ",")
 			}
-			arg := record.Args[len(record.Args)-1]
-			arg = strings.TrimLeft(arg, "0")
-			if arg == "" {
-				arg = "0"
-			}
-			sb.WriteString(arg)
+			sb.WriteString(record.Args[len(record.Args)-1])
 		} else {
-			sb.WriteString(value)
+			sb.WriteString(record.Value)
 		}
 	}
 	return sb.String()

@@ -1,20 +1,20 @@
-// Taoufik 03/2023
+// Package storage Taoufik 03/2023
 package storage
 
 import (
 	"encoding/hex"
-	"errors"
 	"fmt"
+	"github.com/mazeboard/storage/dbWriter"
+	"github.com/mazeboard/storage/fileWriter"
+	"github.com/mazeboard/storage/kafkaWriter"
+	"github.com/mazeboard/storage/s3Writer"
+	"log"
 	"os"
-	"storage/utils"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/node"
+	"github.com/mazeboard/storage/utils"
 )
 
 type State struct {
@@ -27,16 +27,15 @@ type State struct {
 }
 
 type Data struct {
-	States    []State
-	Keccas    map[string]KeccaEntry
-	Contracts []AccountEntry
+	States    []*State
+	keccaks   map[string]*KeccakEntry
+	Contracts []*AccountEntry
 	Hashes    map[string]void
 }
 
-type KeccaEntry struct {
-	Pos     int
-	Args    []string
-	Indexes []int
+type KeccakEntry struct {
+	Pos  string
+	Args []string
 }
 
 type AccountEntry struct {
@@ -48,244 +47,150 @@ type AccountEntry struct {
 
 type void struct{}
 
-var destination string // kafka, s3, postgres
-
-var chanData = make(chan Data, 100)
-var lock sync.RWMutex
-var stateEntries []State = []State{}
-var keccaEntries = make(map[string]KeccaEntry)
-var accountEntries = []AccountEntry{}
-var hashEntries = make(map[string]void)
-var runningNode *node.Node
-var writer StorageWriter
-
-func (k *KeccaEntry) String() string {
-	return fmt.Sprintf("%d args:%v indexes:%v", k.Pos, k.Args, k.Indexes)
+type Storage struct {
+	dataChannel    chan *Data
+	ErrorChannel   chan error
+	EndChannel     chan bool
+	lock           sync.RWMutex
+	stateEntries   []*State
+	keccakEntries  map[string]*KeccakEntry
+	accountEntries []*AccountEntry
+	hashEntries    map[string]void
+	writer         utils.StorageWriter
+	upload         bool
+	ts             string
+	writerData     string
 }
 
-func fatal(msg string, err error) {
-	log.Error(msg, "error", err)
-	runningNode.Close()
-	log.Crit(msg, "error", err)
+var CurrentStorage *Storage
+
+func (s *Storage) watch(close func()) {
+	err := <-s.ErrorChannel
+	log.Printf("storage failed - error %s\n", err)
+	s.dataChannel <- nil
+	close()
 }
-func Init(dest string, stack *node.Node) {
-	runningNode = stack
-	destination = dest
+func (s *Storage) Wait() {
+	s.dataChannel <- nil
+	<-s.EndChannel // block until storage is done
+	log.Printf("storage end\n")
+}
+
+// TOD save block number in s3
+func New(close func(), setHead func(uint64)) *Storage {
+	destination := os.Getenv("STORAGE_DESTINATION")
+	if destination == "" {
+		destination = "file"
+	}
+	st := Storage{
+		dataChannel:    make(chan *Data, 100),
+		ErrorChannel:   make(chan error),
+		EndChannel:     make(chan bool),
+		lock:           sync.RWMutex{},
+		stateEntries:   []*State{},
+		keccakEntries:  make(map[string]*KeccakEntry),
+		accountEntries: []*AccountEntry{},
+		hashEntries:    make(map[string]void),
+		upload:         false,
+	}
+	go st.watch(close)
+	var err error
+	var writer utils.StorageWriter
 	switch destination {
 	case "kafka":
-		// TODO authentication
-		host := os.Getenv("KAFKA_HOST")
-		if host == "" {
-			host = "localhost"
-		}
-		log.Info("init storage (kafka producer)", "host", host)
+		log.Printf("new kafka storage\n")
 
-		writer = KafkaWriter
+		writer, err = kafkaWriter.New(&st.ErrorChannel)
 
 	case "s3":
+		log.Printf("new s3 storage\n")
 
-		writer = S3Writer
+		writer, err = s3Writer.New(&st.ErrorChannel)
+
+	case "file":
+		log.Printf("new file storage\n")
+
+		writer, err = fileWriter.New(&st.ErrorChannel)
 
 	case "database":
+		log.Printf("new database storage\n")
 
-		writer = DatabaseWriter
-
-	default:
-		fatal(fmt.Sprintf("--states=%s", destination), errors.New("invalid states cli argument, valid states are kafka ans s3"))
+		writer, err = dbWriter.New(&st.ErrorChannel)
 	}
-	go uploadLoop()
-}
 
-func WriteBalance(txHash string, timestamp uint64, block_number int64, contract common.Address, balance string) {
-	lock.Lock()
-	defer lock.Unlock()
-	hashEntries[txHash] = void{}
-	accountEntries = append(accountEntries, AccountEntry{
-		BlockNumber: block_number,
-		Timestamp:   int64(timestamp),
-		Addr:        contract[:],
-		Balance:     balance,
-	})
-}
-
-func Write(h string, timestamp uint64, blockNumber int64, contract common.Address, loc [32]byte, value [32]byte) {
-	lock.Lock()
-	defer lock.Unlock()
-	stateEntries = append(stateEntries, State{
-		TxHash:      h,
-		BlockNumber: blockNumber,
-		Contract:    contract[:],
-		Location:    loc[:],
-		Value:       value[:],
-		Timestamp:   int64(timestamp),
-	})
-}
-
-func WriteKecca256(newloc string, data string) {
-	l := len(data)
-	if l > 64 { // hex characters
-		p := data[64:]
-		arg := strings.TrimLeft(data[:64], "0")
-		lock.Lock()
-		defer lock.Unlock()
-		if d, ok := keccaEntries[p]; ok {
-			keccaEntries[newloc] = KeccaEntry{Pos: d.Pos, Indexes: d.Indexes, Args: append(d.Args, arg)}
-		} else {
-			if pos, err := strconv.ParseInt(p, 16, 32); err == nil {
-				keccaEntries[newloc] = KeccaEntry{Pos: int(pos), Args: []string{arg}}
-			}
-		}
+	if err != nil {
+		st.ErrorChannel <- err
 	} else {
-		if l == 64 {
-			lock.Lock()
-			defer lock.Unlock()
-			if d, ok := keccaEntries[data]; ok {
-				keccaEntries[newloc] = d
-			} else {
-				if pos, err := strconv.ParseInt(data, 16, 32); err == nil {
-					keccaEntries[newloc] = KeccaEntry{Pos: int(pos)}
-				}
-			}
-		} //else {
-		/*
-			WARN [04-17|22:55:37.162] kecca newloc=b052050c6ed400a931c7e68cb2c3fd217e53c8cfa638ee94c32b17947c0f6ea4 data=55524c11
-
-			log.Warn("kecca", "newloc", newloc, "data", data)
-		*/
-		//}
-	}
-}
-
-func WriteKecca256Add(newloc string, oldloc string, data [32]byte) {
-	lock.Lock()
-	defer lock.Unlock()
-	if d, ok := keccaEntries[oldloc]; ok {
-		if _, ok := keccaEntries[newloc]; !ok {
-			if index, err := strconv.ParseInt(hex.EncodeToString(data[:]), 16, 32); err == nil {
-				keccaEntries[newloc] = KeccaEntry{Pos: d.Pos, Indexes: append(d.Indexes, int(index)), Args: d.Args}
-			}
+		if err != nil {
+			st.ErrorChannel <- err
+		} else {
+			setHead(uint64(writer.LastBlockNumber()))
+			st.writer = writer
+			go st.uploadLoop()
 		}
 	}
+	return &st
 }
 
-func Upload() {
-	lock.Lock()
-	defer lock.Unlock()
-	if len(stateEntries) > 0 {
-		kentries := map[string]KeccaEntry{}
-		for k, v := range keccaEntries {
-			kentries[k] = v
-		}
-		chanData <- Data{States: stateEntries, Keccas: kentries, Contracts: accountEntries, Hashes: hashEntries}
-		stateEntries = []State{}
-		keccaEntries = make(map[string]KeccaEntry)
-		accountEntries = []AccountEntry{}
-		hashEntries = make(map[string]void)
+func (s *Storage) UploadStorage() {
+	if len(s.stateEntries) > 0 {
+		s.lock.Lock()
+		defer s.lock.Unlock()
+		s.dataChannel <- &Data{States: s.stateEntries, keccaks: s.keccakEntries, Contracts: s.accountEntries, Hashes: s.hashEntries}
+		s.stateEntries = []*State{}
+		s.keccakEntries = make(map[string]*KeccakEntry)
+		s.accountEntries = []*AccountEntry{}
+		s.hashEntries = make(map[string]void)
 	}
 }
 
-func uploadLoop() {
+func (s *Storage) uploadLoop() {
 	for {
-		data := <-chanData
+		data := <-s.dataChannel
+		if data == nil { // received signal to stop (on error nil is added to dataChannel)
+			s.writer.Stop()      // wait for writer to stop
+			s.EndChannel <- true // send signal to geth to stop
+			return
+		}
 		start := time.Now()
-		records := uploadAccounts(data.Contracts)
-		records = append(records, uploadStates(data.States, data.Keccas, data.Hashes)...)
-		writer.UploadRecords(records)
-		log.Info("upload", "chanData", len(chanData), "records", len(records), "elapsed", time.Since(start))
+		//s.saveKeccaks(start, data.keccaks, data.States) // for debug
+		records := append(uploadAccounts(data.Contracts), uploadStates(data.States, data.keccaks, data.Hashes)...)
+		if err := s.writer.UploadRecords(records); err != nil {
+			s.ErrorChannel <- err
+		} else {
+			l := len(s.dataChannel)
+			if l == 0 {
+				log.Printf("upload - records %d - elapsed %s\n", len(records), time.Since(start).String())
+			} else {
+				log.Printf("upload - dataChannel %d - records %d - elapsed %s\n", l, len(records), time.Since(start).String())
+			}
+		}
 	}
 }
 
-func uploadStates(sEntries []State, kEntries map[string]KeccaEntry, hEntries map[string]void) []Record {
-	states := map[string]State{}
+func uploadStates(sEntries []*State, kEntries map[string]*KeccakEntry, hEntries map[string]void) []utils.Record {
+	states := map[string]*State{}
 	for _, e := range sEntries {
 		if _, ok := hEntries[e.TxHash]; ok {
-			addr := hex.EncodeToString(e.Contract)
-			states[fmt.Sprintf("%d,%s,%s", e.BlockNumber, addr, hex.EncodeToString(e.Location))] = e
+			states[fmt.Sprintf("%d,%s,%s", e.BlockNumber, hex.EncodeToString(e.Contract), hex.EncodeToString(e.Location))] = e
 		}
 	}
 
-	records := []utils.Record{}
+	var records []utils.Record
 
 	for _, s := range states {
-		var location *string = nil
-		var position *int = nil
-		var arg1 *string = nil
-		var arg2 *string = nil
-		var index1 *int = nil
-		var index2 *int = nil
-		var index3 *int = nil
+		var position *string = nil
+		var args []string
 
-		loc := hex.EncodeToString(s.Location)
-		if kentry, ok := kEntries[loc]; ok {
-			var posDone bool = false
-			switch len(kentry.Args) {
-			case 1:
-				posDone = true
-				position = &kentry.Pos
-				arg1 = &kentry.Args[0]
-				arg2 = nil
-			case 2:
-				posDone = true
-				position = &kentry.Pos
-				arg1 = &kentry.Args[0]
-				arg2 = &kentry.Args[1]
-			default:
-				arg1 = nil
-				arg2 = nil
-			}
-			switch len(kentry.Indexes) {
-			case 1:
-				if !posDone {
-					position = &kentry.Pos
-					posDone = true
-				}
-				index1 = &kentry.Indexes[0]
-				index2 = nil
-				index3 = nil
-			case 2:
-				if !posDone {
-					position = &kentry.Pos
-					posDone = true
-				}
-				index1 = &kentry.Indexes[0]
-				index2 = &kentry.Indexes[1]
-				index3 = nil
-			case 3:
-				if !posDone {
-					position = &kentry.Pos
-					posDone = true
-				}
-				index1 = &kentry.Indexes[0]
-				index2 = &kentry.Indexes[1]
-				index3 = &kentry.Indexes[2]
-			default:
-				index1 = nil
-				index2 = nil
-				index3 = nil
-			}
-			if !posDone {
-				position = nil
-				location = &loc
-			} else {
-				location = nil
-			}
-		} else {
-			pos64, err := strconv.ParseInt(loc, 16, 32)
-			pos := int(pos64)
-			if err == nil {
-				location = nil
-				position = &pos
-			} else {
-				location = &loc
-				position = nil
-			}
-			arg1 = nil
-			arg2 = nil
-			index1 = nil
-			index2 = nil
-			index3 = nil
+		location := hex.EncodeToString(s.Location)
+		if kentry, ok := kEntries[location]; ok {
+			position = &kentry.Pos
+			args = kentry.Args
 		}
-
+		location = strings.TrimLeft(location, "0")
+		if location == "" {
+			location = "0"
+		}
 		records = append(records, utils.Record{
 			StateChange: &utils.StateChangeRecord{
 				BlockNumber: s.BlockNumber,
@@ -293,23 +198,20 @@ func uploadStates(sEntries []State, kEntries map[string]KeccaEntry, hEntries map
 				Contract:    hex.EncodeToString(s.Contract),
 				Location:    location,
 				Position:    position,
-				Arg1:        arg1,
-				Arg2:        arg2,
-				Index1:      index1,
-				Index2:      index2,
-				Index3:      index3,
+				Args:        args,
+				Value:       hex.EncodeToString(s.Value),
 			}})
 	}
 	return records
 }
 
-func uploadAccounts(cEntries []AccountEntry) []utils.Record {
-	centries := map[string]AccountEntry{}
+func uploadAccounts(cEntries []*AccountEntry) []utils.Record {
+	centries := map[string]*AccountEntry{}
 	for _, e := range cEntries {
 		addr := hex.EncodeToString(e.Addr)
 		centries[fmt.Sprintf("%d,%s", e.BlockNumber, addr)] = e
 	}
-	records := []utils.Record{}
+	var records []utils.Record
 	for _, s := range centries {
 		records = append(records, utils.Record{
 			AccountBalance: &utils.AccountBalanceRecord{
@@ -320,4 +222,121 @@ func uploadAccounts(cEntries []AccountEntry) []utils.Record {
 			}})
 	}
 	return records
+}
+
+func (s *Storage) WriteBalance(txHash string, timestamp uint64, blockNumber int64, contract []byte, balance string) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	s.hashEntries[txHash] = void{}
+	s.accountEntries = append(s.accountEntries, &AccountEntry{
+		BlockNumber: blockNumber,
+		Timestamp:   int64(timestamp),
+		Addr:        contract,
+		Balance:     balance,
+	})
+}
+
+func (s *Storage) Write(h string, timestamp uint64, blockNumber int64, contract []byte, loc [32]byte, value [32]byte) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.stateEntries = append(s.stateEntries, &State{
+		TxHash:      h,
+		BlockNumber: blockNumber,
+		Contract:    contract,
+		Location:    loc[:],
+		Value:       value[:],
+		Timestamp:   int64(timestamp),
+	})
+}
+
+func (s *Storage) WriteKeccak256(newloc string, data string) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if _, ok := s.keccakEntries[newloc]; !ok { // new location
+		l := len(data)
+		switch true {
+		case l <= 64:
+			if d, ok := s.keccakEntries[data]; !ok { // data is not a hash, then data is the position of a variable
+				pos := strings.TrimLeft(data, "0")
+				if data == "" {
+					data = "0"
+				}
+				s.keccakEntries[newloc] = &KeccakEntry{Pos: pos}
+			} else { // k(k(x)+0)
+				s.keccakEntries[newloc] = &KeccakEntry{Pos: d.Pos, Args: append(d.Args, "0")}
+			}
+		default:
+			// h(k) . pos
+			pos := data[64:]
+			if d, ok := s.keccakEntries[pos]; ok { // pos is a hash
+				// h(k) . keccak256(X)
+				s.keccakEntries[newloc] = &KeccakEntry{Pos: d.Pos, Args: append(d.Args, data[:64])}
+			} else {
+				// h(k) . p  // TODO check p sometimes is a long hex string (> 32 bytes)
+				if l == 128 {
+					pos = strings.TrimLeft(pos, "0")
+					if pos == "" {
+						pos = "0"
+					}
+					s.keccakEntries[newloc] = &KeccakEntry{Pos: pos, Args: []string{data[:64]}}
+				} /*else { //p is not a position nor a hash (p must be 32 bytes), can be very long data
+					s.keccakEntries[newloc] = &KeccakEntry{Pos: pos, Args: []string{data[:64]}}
+				}*/
+			}
+		}
+	}
+}
+func (s *Storage) WriteKeccak256Add(newloc string, oldloc string, data string) bool {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if d, ok := s.keccakEntries[oldloc]; ok { // add computing new hash from old hash
+		if _, ok := s.keccakEntries[newloc]; !ok { // new location
+			s.keccakEntries[newloc] = &KeccakEntry{Pos: d.Pos, Args: append(d.Args, data[:])}
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Storage) saveKeccaks(t time.Time, keccaks map[string]*KeccakEntry, states []*State) {
+	if dir, err := os.UserHomeDir(); err == nil {
+		datadir := dir + "/.storage"
+		name := fmt.Sprintf("%s/k_%d", datadir, t.UnixNano())
+		f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY, 0755)
+		if err == nil {
+			defer func() {
+				err := f.Close()
+				if err != nil {
+					log.Println("error", err)
+				}
+			}()
+			_, err := f.WriteString(fmt.Sprintf("kentries:\n"))
+			if err != nil {
+				log.Println("error", err)
+			}
+			for k, v := range keccaks {
+				_, err := f.WriteString(fmt.Sprintf("   %s,%v\n", k, v))
+				if err != nil {
+					log.Println("error", err)
+				}
+			}
+			_, err = f.WriteString(fmt.Sprintf("locations:\n"))
+			if err != nil {
+				log.Println("error", err)
+			}
+			for _, v := range states {
+				r, ok := keccaks[hex.EncodeToString(v.Location)]
+				if !ok {
+					r = nil
+				}
+				_, err := f.WriteString(fmt.Sprintf("   addr:%s loc:%s = %v\n", hex.EncodeToString(v.Contract), hex.EncodeToString(v.Location), r))
+				if err != nil {
+					log.Println("error", err)
+				}
+			}
+		} else {
+			log.Println("error", err)
+		}
+	}
 }
