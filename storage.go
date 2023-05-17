@@ -34,8 +34,8 @@ type Data struct {
 }
 
 type KeccakEntry struct {
-	Pos  string
-	Args []string
+	Position string
+	Args     []string
 }
 
 type AccountEntry struct {
@@ -184,7 +184,7 @@ func uploadStates(sEntries []*State, kEntries map[string]*KeccakEntry, hEntries 
 
 		location := hex.EncodeToString(s.Location)
 		if kentry, ok := kEntries[location]; ok {
-			position = &kentry.Pos
+			position = &kentry.Position
 			args = kentry.Args
 		}
 		location = strings.TrimLeft(location, "0")
@@ -259,19 +259,19 @@ func (s *Storage) WriteKeccak256(newloc string, data string) {
 		case l <= 64:
 			if d, ok := s.keccakEntries[data]; !ok { // data is not a hash, then data is the position of a variable
 				pos := strings.TrimLeft(data, "0")
-				if data == "" {
-					data = "0"
+				if pos == "" {
+					pos = "0"
 				}
-				s.keccakEntries[newloc] = &KeccakEntry{Pos: pos}
+				s.keccakEntries[newloc] = &KeccakEntry{Position: pos}
 			} else { // k(k(x)+0)
-				s.keccakEntries[newloc] = &KeccakEntry{Pos: d.Pos, Args: append(d.Args, "0")}
+				s.keccakEntries[newloc] = &KeccakEntry{Position: d.Position, Args: append(d.Args, "0")}
 			}
 		default:
 			// h(k) . pos
 			pos := data[64:]
 			if d, ok := s.keccakEntries[pos]; ok { // pos is a hash
 				// h(k) . keccak256(X)
-				s.keccakEntries[newloc] = &KeccakEntry{Pos: d.Pos, Args: append(d.Args, data[:64])}
+				s.keccakEntries[newloc] = &KeccakEntry{Position: d.Position, Args: append(d.Args, data[:64])}
 			} else {
 				// h(k) . p  // TODO check p sometimes is a long hex string (> 32 bytes)
 				if l == 128 {
@@ -279,9 +279,9 @@ func (s *Storage) WriteKeccak256(newloc string, data string) {
 					if pos == "" {
 						pos = "0"
 					}
-					s.keccakEntries[newloc] = &KeccakEntry{Pos: pos, Args: []string{data[:64]}}
+					s.keccakEntries[newloc] = &KeccakEntry{Position: pos, Args: []string{data[:64]}}
 				} /*else { //p is not a position nor a hash (p must be 32 bytes), can be very long data
-					s.keccakEntries[newloc] = &KeccakEntry{Pos: pos, Args: []string{data[:64]}}
+					s.keccakEntries[newloc] = &KeccakEntry{Position: pos, Args: []string{data[:64]}}
 				}*/
 			}
 		}
@@ -292,7 +292,7 @@ func (s *Storage) WriteKeccak256Add(newloc string, oldloc string, data string) b
 	defer s.lock.Unlock()
 	if d, ok := s.keccakEntries[oldloc]; ok { // add computing new hash from old hash
 		if _, ok := s.keccakEntries[newloc]; !ok { // new location
-			s.keccakEntries[newloc] = &KeccakEntry{Pos: d.Pos, Args: append(d.Args, data[:])}
+			s.keccakEntries[newloc] = &KeccakEntry{Position: d.Position, Args: append(d.Args, data[:])}
 			return true
 		}
 	}

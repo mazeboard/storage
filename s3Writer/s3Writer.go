@@ -27,7 +27,6 @@ type FileRecord struct {
 }
 type s3Writer struct {
 	utils.StorageWriter
-	sessionLock     sync.RWMutex
 	s3Services      []*s3.S3
 	bucket          string
 	prefix          string
@@ -63,8 +62,6 @@ func New(errorChannel *chan error) (utils.StorageWriter, error) {
 		prefix:          prefix,
 		files:           make(map[string]*FileRecord),
 		filesLock:       sync.RWMutex{},
-		sessionLock:     sync.RWMutex{},
-		//uploader:        s3manager.NewUploader(sess),
 		running:         true,
 		stopped:         make(chan bool),
 		lastBlockNumber: 0,
@@ -76,9 +73,6 @@ func New(errorChannel *chan error) (utils.StorageWriter, error) {
 		w.dataFile = dir + "/.s3WriterData"
 	}
 
-	for i := 0; i < w.nconnections; i++ {
-		w.connectionLocks = append(w.connectionLocks, sync.RWMutex{})
-	}
 	w.createConnections()
 	w.readData()
 	go w.watch()
@@ -87,6 +81,7 @@ func New(errorChannel *chan error) (utils.StorageWriter, error) {
 
 func (w *s3Writer) createConnections() {
 	for i := 0; i < w.nconnections; i++ {
+		w.connectionLocks = append(w.connectionLocks, sync.RWMutex{})
 		w.s3Services = append(w.s3Services, s3.New(w.createSession()))
 	}
 }
@@ -104,7 +99,6 @@ func (w *s3Writer) createSession() *session.Session {
 	}
 }
 func (w *s3Writer) recreateConnection(s3SvcIndex int) {
-	log.Printf("s3Writer recreate connection %d\n", s3SvcIndex)
 	w.s3Services[s3SvcIndex] = s3.New(w.createSession())
 }
 
@@ -189,6 +183,7 @@ func (w *s3Writer) getObject(s3SvcIndex int, file string) (io.ReadCloser, error)
 			}
 		}
 		time.Sleep(5 * time.Second)
+		log.Printf("s3Writer recreate connection %d - error %s\n", s3SvcIndex, err)
 		w.recreateConnection(s3SvcIndex)
 		return w.getObject(s3SvcIndex, file)
 	} else {
@@ -203,6 +198,7 @@ func (w *s3Writer) putObject(s3SvcIndex int, file string, body []byte) error {
 		Body:   bytes.NewReader(body),
 	}); err != nil {
 		time.Sleep(5 * time.Second)
+		log.Printf("s3Writer recreate connection %d - error %s\n", s3SvcIndex, err)
 		w.recreateConnection(s3SvcIndex)
 		return w.putObject(s3SvcIndex, file, body)
 	}
@@ -380,27 +376,13 @@ func (w *s3Writer) stateChangeRow(record *utils.StateChangeRecord) string {
 	if value == "" {
 		value = "0"
 	}
-	if record.Position == nil {
-		sb.WriteString(value)
-	} else {
-		if len(record.Args) > 0 {
-			sb.WriteString(value + ",")
-			for _, arg := range record.Args[:len(record.Args)-1] {
-				arg = strings.TrimLeft(arg, "0")
-				if arg == "" {
-					arg = "0"
-				}
-				sb.WriteString(arg + ",")
-			}
-			arg := record.Args[len(record.Args)-1]
-			arg = strings.TrimLeft(arg, "0")
-			if arg == "" {
-				arg = "0"
-			}
-			sb.WriteString(arg)
-		} else {
-			sb.WriteString(value)
+	sb.WriteString(value)
+	for _, arg := range record.Args {
+		arg = strings.TrimLeft(arg, "0")
+		if arg == "" {
+			arg = "0"
 		}
+		sb.WriteString("," + arg)
 	}
 	return sb.String()
 }
